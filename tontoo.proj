@@ -1,0 +1,6 @@
+{
+  "bundle_id": "com.tontoo.menubar",
+  "name": "Menubar",
+  "version": "26.1.0",
+  "icon": "Resources/icon.png"
+}
