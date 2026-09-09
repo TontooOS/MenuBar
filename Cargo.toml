@@ -11,8 +11,9 @@ name = "menubar"
 path = "src/main.rs"
 
 [dependencies]
-sdk = { path = "/Library/System/sdk", features = ["UIKit", "CoreIcon"] }
+sdk = { path = "/Library/System/sdk", features = ["UIKit", "CoreIcon", "CoreWindows", "Accessibility"] }
 gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+gtk4-layer-shell = "0.5"
 glib = "0.20"
 x11rb = { version = "0.13", features = ["randr", "shape"] }
 serde = { version = "1", features = ["derive"] }

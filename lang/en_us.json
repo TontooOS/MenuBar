@@ -1,5 +1,27 @@
 {
-  "name": "Menubar",
-  "menubar.test": "Test",
-  "menubar.app_name": "TontooOS"
+  "lang": "en_us",
+  "translations": {
+    "menu.about": "About This Maschine",
+    "menu.settings": "System Settings…",
+    "menu.appstore": "App Store…",
+    "menu.recent": "Recent Items",
+    "menu.forcequit": "Force Quit…",
+    "menu.sleep": "Sleep",
+    "menu.restart": "Restart…",
+    "menu.shutdown": "Shut Down…",
+    "menu.lock": "Lock Screen",
+    "menu.logout": "Log Out %user%…",
+    "menu.hide_app": "Hide %app%",
+    "menu.hide_others": "Hide Others",
+    "menu.quit_app": "Quit %app%",
+    "menu.file": "File",
+    "menu.edit": "Edit",
+    "menu.view": "View",
+    "menu.go": "Go",
+    "menu.window": "Window",
+    "menu.help": "Help",
+    "menu.example1": "Example Item 1",
+    "menu.example2": "Example Item 2",
+    "menu.example3": "Example Item 3"
+  }
 }

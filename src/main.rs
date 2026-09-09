@@ -21,6 +21,10 @@ use UIKit::prelude::*;
 use CoreIcon::octopus::OctopusVariant;
 use CoreIcon::{Color as IconColor, SFSymbol};
 use CoreIcon::generator::{IconCanvas, RecolorMode, RecolorOptions};
+// CoreWindows via SDK: selected-app resolution + Hide/Quit/ForceQuit actions.
+use CoreWindows::WindowsProvider;
+// Accessibility via SDK: DE/EN translations from lang/*.json.
+use Accessibility::LangStore;
 
 // ── Config ──────────────────────────────────────────────────────────────
 // Breite: immer gesamte Bildschirmbreite (z.B. 1920 bei 1920x1080).
@@ -37,6 +41,15 @@ thread_local! {
     static LAST_APP_NAME: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
     static OCTOPUS_MENUS: std::cell::RefCell<Vec<gtk::Popover>> = std::cell::RefCell::new(Vec::new());
     static LAST_SCHEME: std::cell::RefCell<Option<ColorScheme>> = std::cell::RefCell::new(None);
+    static TOP_MENUS: std::cell::RefCell<Vec<(gtk::Box, gtk::Popover, TopMenuKind)>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Kind of a top-level menubar menu (trigger wrap + popover).
+#[derive(Clone, Copy)]
+enum TopMenuKind {
+    Octopus,
+    App,
+    Example(&'static str),
 }
 
 /// Höhe für einen Monitor bestimmen (Notch-Logik).
@@ -96,57 +109,78 @@ fn is_notch_monitor(monitor: Option<&gtk::gdk::Monitor>) -> bool {
     false
 }
 
-// ── i18n ────────────────────────────────────────────────────────────────
-/// Minimaler Lang-Loader: liest lang/en_us.json & lang/de_de.json.
-/// Auswahl via $LANG / $LC_ALL (enthält "de" -> de_de, sonst en_us).
-/// Fällt auf "Test" zurück wenn keine Datei vorhanden ist.
-fn load_lang() -> std::collections::HashMap<String, String> {
-    let lang_code = std::env::var("LANG")
+// ── i18n via Accessibility ──────────────────────────────────────────────
+/// System language: "de_de" when $LANG/$LC_ALL starts with "de", else "en_us".
+fn sys_lang() -> String {
+    let code = std::env::var("LANG")
         .or_else(|_| std::env::var("LC_ALL"))
         .unwrap_or_else(|_| "en_US".to_string())
         .to_lowercase();
-    let use_de = lang_code.starts_with("de");
+    if code.starts_with("de") {
+        "de_de".to_string()
+    } else {
+        "en_us".to_string()
+    }
+}
 
-    let rel_paths = [
-        // When running from cargo (dev): exe in target/debug/menubar -> ../../lang
-        // When installed: /usr/bin/menubar -> /usr/share/tontoo/menubar/lang or ./lang
-        format!(
-            "{}/lang/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            if use_de { "de_de.json" } else { "en_us.json" }
-        ),
-        format!("./lang/{}", if use_de { "de_de.json" } else { "en_us.json" }),
-        format!("/usr/share/tontoo/menubar/lang/{}", if use_de { "de_de.json" } else { "en_us.json" }),
-        // WSL absolute fallback
-        format!(
-            "/mnt/c/Users/arlo1/Documents/TontooProgramms/Menubar/lang/{}",
-            if use_de { "de_de.json" } else { "en_us.json" }
-        ),
+/// Translate `key` with the system language (Accessibility LangStore).
+fn trk(key: &str) -> String {
+    let lang = sys_lang();
+    LangStore::instance()
+        .t(&lang, key, None)
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// Translate `key` with `%name%` placeholders from `args`.
+fn trk_args(key: &str, args: &[(&str, &str)]) -> String {
+    let map: std::collections::HashMap<String, String> = args
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let lang = sys_lang();
+    LangStore::instance()
+        .t(&lang, key, Some(&map))
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// Init the Accessibility LangStore from the menubar lang dir candidates.
+/// Call once at startup, before any translation.
+fn init_i18n() {
+    let candidates = [
+        format!("{}/lang", env!("CARGO_MANIFEST_DIR")),
+        "./lang".to_string(),
+        "/usr/share/tontoo/menubar/lang".to_string(),
+        "/mnt/c/Users/arlo1/Documents/TontooProgramms/Menubar/lang".to_string(),
     ];
-
-    for p in &rel_paths {
-        if let Ok(content) = std::fs::read_to_string(p) {
-            if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&content) {
-                return map;
+    let mut files = Vec::new();
+    for dir in &candidates {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Ok(f) = Accessibility::LangFile::from_file(&path) {
+                        files.push(f);
+                    }
+                }
             }
         }
+        if !files.is_empty() {
+            break;
+        }
     }
-    let mut fallback = std::collections::HashMap::new();
-    fallback.insert("menubar.test".to_string(), "Test".to_string());
-    fallback
+    if let Err(e) = LangStore::init(files, Some("en_us".to_string())) {
+        eprintln!("[menubar] i18n init failed: {e}");
+    }
 }
 
-fn tr(map: &std::collections::HashMap<String, String>, key: &str) -> String {
-    map.get(key).cloned().unwrap_or_else(|| key.to_string())
-}
-
-// ── Transparent CSS + OS Shadow OFF (Shadow vorerst entfernt) ─────────
+// ── Transparent Window + Top-to-Bottom Shadow Gradient ────────────────
 fn install_transparent_css() {
     if let Some(display) = gtk::gdk::Display::default() {
         let provider = gtk::CssProvider::new();
-        // Window vollständig transparent, nur Octopus + Label zeichnen.
+        // Window selbst transparent, Bar mit Verlauf von ganz oben (stark)
+        // bis Ende der Bar (leicht) fuer Lesbarkeit.
         // SF Pro Fonts liegen im ISO unter /usr/share/fonts/OTF + /TTF.
-        // OS-Compositor-Shadow deaktiviert, eigener Shadow aktuell aus.
+        // OS-Compositor-Shadow deaktiviert, eigener Shadow = Verlauf.
         provider.load_from_string(&format!(
             r#"
             window {{
@@ -168,12 +202,20 @@ fn install_transparent_css() {
                 outline: none;
             }}
             .menubar-root {{
+                background: linear-gradient(to bottom,
+                    rgba(0,0,0,0.24) 0%,
+                    rgba(0,0,0,0.15) 30%,
+                    rgba(0,0,0,0) 60%,
+                    rgba(0,0,0,0) 100%);
                 background-color: transparent;
-                background: transparent;
             }}
             .menubar-bar {{
+                background: linear-gradient(to bottom,
+                    rgba(0,0,0,0.24) 0%,
+                    rgba(0,0,0,0.15) 30%,
+                    rgba(0,0,0,0) 60%,
+                    rgba(0,0,0,0) 100%);
                 background-color: transparent;
-                background: transparent;
                 min-height: {h}px;
                 border: none;
                 box-shadow: none;
@@ -474,6 +516,171 @@ fn build_octopus_menu(parent: &impl IsA<gtk::Widget>) -> gtk::Popover {
     popover
 }
 
+/// Launch ~/Applications/SystemOverview.app via the tapp runner.
+/// TApp is always installed on the machine, so /usr/bin/tapp exists.
+fn launch_system_overview() {
+    const TAPP: &str = "/usr/bin/tapp";
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("[menubar] cannot launch SystemOverview: $HOME not set");
+        return;
+    };
+    let bundle = format!("{home}/Applications/SystemOverview.app");
+    if !std::path::Path::new(&bundle).exists() {
+        eprintln!("[menubar] SystemOverview not found at {bundle}");
+        return;
+    }
+    match std::process::Command::new(TAPP)
+        .arg(&bundle)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => println!("[menubar] launched SystemOverview via tapp"),
+        Err(e) => eprintln!("[menubar] tapp launch failed: {e}"),
+    }
+}
+
+/// Fast reachability probe for the window daemon.
+/// The CoreWindows lib blocks up to 10s per call (REQUEST_TIMEOUT), so it
+/// must never be touched on the GTK main thread unless a connection
+/// succeeds immediately. Missing socket / refused connection = fast `false`.
+fn daemon_reachable() -> bool {
+    let path = std::env::var("WINDOWS_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(CoreWindows::DEFAULT_SOCKET_PATH));
+    if !path.exists() {
+        return false;
+    }
+    std::os::unix::net::UnixStream::connect(&path).is_ok()
+}
+
+/// Daemon window list, but only when the daemon answers immediately.
+/// Returns `None` when unreachable so callers fall back to X11 fast.
+fn corewindows_windows() -> Option<Vec<CoreWindows::WindowInfo>> {
+    if !daemon_reachable() {
+        return None;
+    }
+    WindowsProvider::from_env().windows().ok()
+}
+
+/// Selected app as (display name, pid).
+/// Name resolution via CoreWindows (real .app bundles), X11 WM_CLASS fallback.
+/// The daemon has no focus concept, so the active window still comes from X11
+/// and is bridged to CoreWindows via _NET_WM_PID.
+fn selected_app() -> (String, Option<i32>) {
+    let pid = x11_place::get_active_window().and_then(x11_place::get_window_pid);
+    if let Some(pid) = pid {
+        if let Some(windows) = corewindows_windows() {
+            if let Some(w) = windows.iter().find(|w| w.pid == Some(pid)) {
+                // Bundle names are reliable; plain X11 titles are not app names.
+                if w.bundle_id.is_some() {
+                    if let Some(name) = w.app_name.clone().filter(|s| !s.trim().is_empty()) {
+                        return (name, Some(pid));
+                    }
+                }
+            }
+        }
+    }
+    (x11_place::get_active_app_name(), pid)
+}
+
+/// Daemon window ids owned by `pid` (empty when the daemon is unreachable).
+fn daemon_windows_of(pid: i32) -> Vec<u64> {
+    corewindows_windows()
+        .map(|ws| {
+            ws.into_iter()
+                .filter(|w| w.pid == Some(pid))
+                .map(|w| w.id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Hide the selected app (minimize its windows). X11 fallback when the
+/// daemon is unreachable.
+fn hide_current_app() {
+    if let (_, Some(pid)) = selected_app() {
+        let ids = daemon_windows_of(pid);
+        if !ids.is_empty() {
+            let provider = WindowsProvider::from_env();
+            for id in ids {
+                if let Err(e) = provider.minimize_window(id) {
+                    eprintln!("[menubar] minimize {id} failed: {e}");
+                }
+            }
+            return;
+        }
+    }
+    if let Some(xid) = x11_place::get_active_window() {
+        x11_place::minimize_window(xid);
+    }
+}
+
+/// Hide everything except the selected app. X11 fallback when unreachable.
+fn hide_other_apps() {
+    let active_pid = x11_place::get_active_window().and_then(x11_place::get_window_pid);
+    let provider = WindowsProvider::from_env();
+    if let Some(windows) = corewindows_windows() {
+        if active_pid.is_some() || !windows.is_empty() {
+            for w in &windows {
+                if w.pid != active_pid {
+                    if let Err(e) = provider.minimize_window(w.id) {
+                        eprintln!("[menubar] minimize {} failed: {e}", w.id);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    let active = x11_place::get_active_window();
+    for xid in x11_place::get_client_list() {
+        if Some(xid) != active {
+            // Menubar/Dock selbst nicht verstecken (sind dock-type, meist nicht in Liste)
+            x11_place::minimize_window(xid);
+        }
+    }
+}
+
+/// Quit the selected app (graceful close of its windows). X11 fallback.
+fn quit_current_app() {
+    if let (_, Some(pid)) = selected_app() {
+        let ids = daemon_windows_of(pid);
+        if !ids.is_empty() {
+            let provider = WindowsProvider::from_env();
+            for id in ids {
+                if let Err(e) = provider.close_window(id) {
+                    eprintln!("[menubar] close {id} failed: {e}");
+                }
+            }
+            return;
+        }
+        if let Some(xid) = x11_place::get_active_window() {
+            x11_place::close_window(xid);
+        }
+    }
+}
+
+/// Force quit the selected app (SIGKILL, no save dialog).
+/// Never touches the menubar or dock themselves.
+fn force_quit_current_app() {
+    let Some(xid) = x11_place::get_active_window() else {
+        return;
+    };
+    if let Some(cls) = x11_place::get_wm_class(xid) {
+        let lower = cls.to_lowercase();
+        if lower == "menubar" || lower == "dock" {
+            return;
+        }
+    }
+    if let Some(pid) = x11_place::get_window_pid(xid) {
+        match CoreWindows::force_quit_pid(pid) {
+            Ok(()) => println!("[menubar] force quit pid {pid}"),
+            Err(e) => eprintln!("[menubar] force quit pid {pid} failed: {e}"),
+        }
+    }
+}
+
 fn set_octopus_menu_content(popover: &gtk::Popover) {
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
     menu.add_css_class("octopus-menu");
@@ -488,24 +695,33 @@ fn set_octopus_menu_content(popover: &gtk::Popover) {
     }
 
     struct Entry {
-        label: &'static str,
+        label: String,
         icon: Option<SFSymbol>,
         shortcut: Option<&'static str>,
         arrow: bool,
         sep_before: bool,
+        action: OctopusAction,
     }
 
-    let entries: &[Entry] = &[
-        Entry { label: "About This Maschine", icon: Some(CoreIcon::DESKTOPCOMPUTER), shortcut: None, arrow: false, sep_before: false },
-        Entry { label: "System Settings…", icon: Some(CoreIcon::GEARSHAPE_FILL), shortcut: None, arrow: false, sep_before: false },
-        Entry { label: "App Store…", icon: Some(CoreIcon::APP_FILL), shortcut: None, arrow: false, sep_before: false },
-        Entry { label: "Recent Items", icon: Some(CoreIcon::CLOCK_FILL), shortcut: None, arrow: true, sep_before: false },
-        Entry { label: "Force Quit…", icon: Some(CoreIcon::XMARK_OCTAGON_FILL), shortcut: Some("⌥⌘⎋"), arrow: false, sep_before: true },
-        Entry { label: "Sleep", icon: Some(CoreIcon::MOON_FILL), shortcut: None, arrow: false, sep_before: true },
-        Entry { label: "Restart…", icon: Some(CoreIcon::ARROW_COUNTERCLOCKWISE), shortcut: None, arrow: false, sep_before: false },
-        Entry { label: "Shut Down…", icon: Some(CoreIcon::POWER), shortcut: None, arrow: false, sep_before: false },
-        Entry { label: "Lock Screen", icon: Some(CoreIcon::LOCK_FILL), shortcut: Some("^⌘Q"), arrow: false, sep_before: true },
-        Entry { label: "Log Out liveuser…", icon: Some(CoreIcon::RECTANGLE_PORTRAIT_AND_ARROW_RIGHT), shortcut: Some("⇧⌘Q"), arrow: false, sep_before: false },
+    #[derive(Clone, Copy)]
+    enum OctopusAction {
+        None,
+        OpenSystemOverview,
+        ForceQuitActive,
+    }
+
+    let user = std::env::var("USER").unwrap_or_else(|_| "liveuser".to_string());
+    let entries: Vec<Entry> = vec![
+        Entry { label: trk("menu.about"), icon: Some(CoreIcon::DESKTOPCOMPUTER), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::OpenSystemOverview },
+        Entry { label: trk("menu.settings"), icon: Some(CoreIcon::GEARSHAPE_FILL), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::None },
+        Entry { label: trk("menu.appstore"), icon: Some(CoreIcon::APP_FILL), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::None },
+        Entry { label: trk("menu.recent"), icon: Some(CoreIcon::CLOCK_FILL), shortcut: None, arrow: true, sep_before: false, action: OctopusAction::None },
+        Entry { label: trk("menu.forcequit"), icon: Some(CoreIcon::XMARK_OCTAGON_FILL), shortcut: Some("⌥⌘⎋"), arrow: false, sep_before: true, action: OctopusAction::ForceQuitActive },
+        Entry { label: trk("menu.sleep"), icon: Some(CoreIcon::MOON_FILL), shortcut: None, arrow: false, sep_before: true, action: OctopusAction::None },
+        Entry { label: trk("menu.restart"), icon: Some(CoreIcon::ARROW_COUNTERCLOCKWISE), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::None },
+        Entry { label: trk("menu.shutdown"), icon: Some(CoreIcon::POWER), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::None },
+        Entry { label: trk("menu.lock"), icon: Some(CoreIcon::LOCK_FILL), shortcut: Some("^⌘Q"), arrow: false, sep_before: true, action: OctopusAction::None },
+        Entry { label: trk_args("menu.logout", &[("user", &user)]), icon: Some(CoreIcon::RECTANGLE_PORTRAIT_AND_ARROW_RIGHT), shortcut: Some("⇧⌘Q"), arrow: false, sep_before: false, action: OctopusAction::None },
     ];
 
     for e in entries {
@@ -536,7 +752,7 @@ fn set_octopus_menu_content(popover: &gtk::Popover) {
             row.append(&sp);
         }
 
-        let lbl = gtk::Label::new(Some(e.label));
+        let lbl = gtk::Label::new(Some(e.label.as_str()));
         lbl.add_css_class("octopus-menu-label");
         lbl.set_halign(gtk::Align::Start);
         lbl.set_hexpand(true);
@@ -558,7 +774,21 @@ fn set_octopus_menu_content(popover: &gtk::Popover) {
 
         let gesture = gtk::GestureClick::new();
         gesture.set_button(1);
-        gesture.connect_pressed(|_, _, _, _| {});
+        let act = e.action;
+        let pop_c = popover.clone();
+        gesture.connect_pressed(move |_, _, _, _| {
+            match act {
+                OctopusAction::OpenSystemOverview => {
+                    launch_system_overview();
+                    pop_c.popdown();
+                }
+                OctopusAction::ForceQuitActive => {
+                    force_quit_current_app();
+                    pop_c.popdown();
+                }
+                OctopusAction::None => {}
+            }
+        });
         row.add_controller(gesture);
 
         menu.append(&row);
@@ -600,10 +830,10 @@ fn set_app_menu_content(popover: &gtk::Popover, app_name: &str) {
     enum AppAction { HideCurrent, HideOthers, Quit }
 
     let entries: Vec<Entry> = vec![
-        Entry { label: format!("Hide {}", app_name), icon: Some(CoreIcon::EYE_SLASH_FILL), action: AppAction::HideCurrent },
-        Entry { label: "Hide Others".to_string(), icon: Some(CoreIcon::EYE_SLASH), action: AppAction::HideOthers },
+        Entry { label: trk_args("menu.hide_app", &[("app", app_name)]), icon: Some(CoreIcon::EYE_SLASH_FILL), action: AppAction::HideCurrent },
+        Entry { label: trk("menu.hide_others"), icon: Some(CoreIcon::EYE_SLASH), action: AppAction::HideOthers },
         // separator vor Quit
-        Entry { label: format!("Quit {}", app_name), icon: Some(CoreIcon::XMARK), action: AppAction::Quit },
+        Entry { label: trk_args("menu.quit_app", &[("app", app_name)]), icon: Some(CoreIcon::XMARK), action: AppAction::Quit },
     ];
 
     for (idx, e) in entries.iter().enumerate() {
@@ -646,25 +876,9 @@ fn set_app_menu_content(popover: &gtk::Popover, app_name: &str) {
         let pop_clone = popover.clone();
         gesture.connect_pressed(move |_, _, _, _| {
             match act {
-                AppAction::HideCurrent => {
-                    if let Some(xid) = x11_place::get_active_window() {
-                        x11_place::minimize_window(xid);
-                    }
-                }
-                AppAction::HideOthers => {
-                    let active = x11_place::get_active_window();
-                    for xid in x11_place::get_client_list() {
-                        if Some(xid) != active {
-                            // Menubar/Dock selbst nicht verstecken (sind dock-type, meist nicht in Liste)
-                            x11_place::minimize_window(xid);
-                        }
-                    }
-                }
-                AppAction::Quit => {
-                    if let Some(xid) = x11_place::get_active_window() {
-                        x11_place::close_window(xid);
-                    }
-                }
+                AppAction::HideCurrent => hide_current_app(),
+                AppAction::HideOthers => hide_other_apps(),
+                AppAction::Quit => quit_current_app(),
             }
             pop_clone.popdown();
         });
@@ -675,7 +889,147 @@ fn set_app_menu_content(popover: &gtk::Popover, app_name: &str) {
     popover.set_child(Some(&menu));
 }
 
-// ── Bar Content (Shadow nur oben, App-Name bold dicker) ───────────────
+// ── Top-level menu registry (click toggle + macOS hover-switch) ──────
+/// Refresh a top-level menu before showing it.
+fn refresh_top_menu(popover: &gtk::Popover, kind: TopMenuKind) {
+    match kind {
+        TopMenuKind::Octopus => set_octopus_menu_content(popover),
+        TopMenuKind::App => {
+            let cur = selected_app().0;
+            set_app_menu_content(popover, &cur);
+        }
+        TopMenuKind::Example(title) => set_example_menu_content(popover, title),
+    }
+}
+
+/// Close every open top-level menu except `except` (if given).
+fn close_other_top_menus(except: Option<&gtk::Popover>) {
+    TOP_MENUS.with(|m| {
+        for (w, p, _) in m.borrow().iter() {
+            let is_except = except.map(|e| p == e).unwrap_or(false);
+            if !is_except && p.is_visible() {
+                p.popdown();
+                w.remove_css_class("octopus-active");
+            }
+        }
+    });
+}
+
+/// Wire a menubar trigger: click toggles its popover, hovering it while
+/// another top-level menu is open switches to it (macOS behavior).
+fn register_top_menu(wrap: &gtk::Box, popover: &gtk::Popover, kind: TopMenuKind) {
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    let pop_c = popover.clone();
+    let wrap_c = wrap.clone();
+    click.connect_pressed(move |_, _, _, _| {
+        if pop_c.is_visible() {
+            pop_c.popdown();
+            wrap_c.remove_css_class("octopus-active");
+        } else {
+            close_other_top_menus(Some(&pop_c));
+            refresh_top_menu(&pop_c, kind);
+            pop_c.popup();
+            wrap_c.add_css_class("octopus-active");
+        }
+    });
+    wrap.add_controller(click);
+    let wrap_closed = wrap.clone();
+    popover.connect_closed(move |_| wrap_closed.remove_css_class("octopus-active"));
+
+    let pop_h = popover.clone();
+    let wrap_h = wrap.clone();
+    let switcher = gtk::EventControllerMotion::new();
+    switcher.connect_enter(move |_, _, _| {
+        let other_open = TOP_MENUS.with(|m| {
+            m.borrow()
+                .iter()
+                .any(|(_, p, _)| p != &pop_h && p.is_visible())
+        });
+        if other_open && !pop_h.is_visible() {
+            close_other_top_menus(Some(&pop_h));
+            refresh_top_menu(&pop_h, kind);
+            pop_h.popup();
+            wrap_h.add_css_class("octopus-active");
+        }
+    });
+    wrap.add_controller(switcher);
+
+    TOP_MENUS.with(|m| m.borrow_mut().push((wrap.clone(), popover.clone(), kind)));
+}
+
+// ── Example menus (static placeholders, macOS-style) ───────────────────
+fn build_example_menu(parent: &impl IsA<gtk::Widget>, title: &'static str) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_autohide(true);
+    popover.set_parent(parent);
+    popover.set_offset(0, 6);
+    set_example_menu_content(&popover, title);
+    popover
+}
+
+fn set_example_menu_content(popover: &gtk::Popover, _title: &str) {
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    menu.add_css_class("octopus-menu");
+    menu.set_halign(gtk::Align::Start);
+    menu.set_valign(gtk::Align::Start);
+    let is_dark = ColorScheme::detect_system() == ColorScheme::Dark;
+    if is_dark {
+        menu.remove_css_class("light");
+    } else {
+        menu.add_css_class("light");
+    }
+
+    for (idx, key) in ["menu.example1", "menu.example2", "menu.example3"]
+        .iter()
+        .enumerate()
+    {
+        if idx == 2 {
+            let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+            sep.add_css_class("octopus-sep");
+            menu.append(&sep);
+        }
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.add_css_class("octopus-menu-item");
+        row.set_halign(gtk::Align::Fill);
+        row.set_hexpand(true);
+        let motion = gtk::EventControllerMotion::new();
+        let row_c = row.clone();
+        motion.connect_enter(move |_, _, _| row_c.add_css_class("hovered"));
+        let row_c2 = row.clone();
+        motion.connect_leave(move |_| row_c2.remove_css_class("hovered"));
+        row.add_controller(motion);
+
+        let lbl = gtk::Label::new(Some(&trk(key)));
+        lbl.add_css_class("octopus-menu-label");
+        lbl.set_halign(gtk::Align::Start);
+        lbl.set_hexpand(true);
+        lbl.set_xalign(0.0);
+        lbl.set_margin_start(4);
+        row.append(&lbl);
+        menu.append(&row);
+    }
+
+    popover.set_child(Some(&menu));
+}
+
+// ── Clock (example status area) ─────────────────────────────────────────
+/// Refresh the clock label via `date` (format like "Mon Jun 23 7:29 PM").
+fn update_clock(label: &gtk::Label) {
+    let text = std::process::Command::new("date")
+        .arg("+%a %b %e %-I:%M %p")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "--".to_string());
+    label.set_text(&text);
+}
+
+// ── Bar Content (Top-to-Bottom Shadow, App-Name bold dicker) ───────────
 fn build_bar_content(app_name: &str, scheme: ColorScheme, bar_height: i32) -> gtk::Widget {
     let is_dark = scheme == ColorScheme::Dark;
     let fg = if is_dark { "#F5F5F7" } else { "#1E1E1E" };
@@ -716,23 +1070,7 @@ fn build_bar_content(app_name: &str, scheme: ColorScheme, bar_height: i32) -> gt
     octopus_wrap.add_controller(motion);
 
     let popover = build_octopus_menu(&octopus_wrap);
-    let click = gtk::GestureClick::new();
-    click.set_button(1);
-    let pop_c = popover.clone();
-    let wrap_c = octopus_wrap.clone();
-    click.connect_pressed(move |_, _, _, _| {
-        if pop_c.is_visible() {
-            pop_c.popdown();
-            wrap_c.remove_css_class("octopus-active");
-        } else {
-            set_octopus_menu_content(&pop_c);
-            pop_c.popup();
-            wrap_c.add_css_class("octopus-active");
-        }
-    });
-    octopus_wrap.add_controller(click);
-    let wrap_closed = octopus_wrap.clone();
-    popover.connect_closed(move |_| wrap_closed.remove_css_class("octopus-active"));
+    register_top_menu(&octopus_wrap, &popover, TopMenuKind::Octopus);
 
     let app_label = gtk::Label::new(Some(app_name));
     app_label.add_css_class("menubar-label");
@@ -756,28 +1094,11 @@ fn build_bar_content(app_name: &str, scheme: ColorScheme, bar_height: i32) -> gt
     motion2.connect_leave(move |_| wrap_a2.remove_css_class("octopus-hover"));
     app_wrap.add_controller(motion2);
     let app_popover = build_app_menu(&app_wrap, app_name);
-    let click2 = gtk::GestureClick::new();
-    click2.set_button(1);
-    let pop2 = app_popover.clone();
-    let wrap2 = app_wrap.clone();
-    click2.connect_pressed(move |_, _, _, _| {
-        if pop2.is_visible() {
-            pop2.popdown();
-            wrap2.remove_css_class("octopus-active");
-        } else {
-            let cur = x11_place::get_active_app_name();
-            set_app_menu_content(&pop2, &cur);
-            pop2.popup();
-            wrap2.add_css_class("octopus-active");
-        }
-    });
-    app_wrap.add_controller(click2);
-    let wrap_closed2 = app_wrap.clone();
-    app_popover.connect_closed(move |_| wrap_closed2.remove_css_class("octopus-active"));
+    register_top_menu(&app_wrap, &app_popover, TopMenuKind::App);
     APP_MENUBAR_STATE.with(|s| s.borrow_mut().push((app_label.clone(), app_popover.clone())));
 
     let css = format!(
-        ".menubar-label {{ font-family: '{}', 'SF Pro', sans-serif; font-size: 13px; font-weight: 400; color: {}; text-shadow: {}; }}\n.app-name-label {{ font-weight: 800; font-family: '{}', 'SF Pro Display', sans-serif; letter-spacing: -0.2px; }}\n.menubar-bar {{ background: transparent; background-color: transparent; min-height: {}px; box-shadow: none; border: none; }}",
+        ".menubar-label {{ font-family: '{}', 'SF Pro', sans-serif; font-size: 13px; font-weight: 400; color: {}; text-shadow: {}; }}\n.app-name-label {{ font-weight: 800; font-family: '{}', 'SF Pro Display', sans-serif; letter-spacing: -0.2px; }}\n.menubar-bar {{ background: linear-gradient(to bottom, rgba(0,0,0,0.24) 0%, rgba(0,0,0,0.15) 30%, rgba(0,0,0,0) 60%, rgba(0,0,0,0) 100%); background-color: transparent; min-height: {}px; box-shadow: none; border: none; }}",
         SF_FAMILY, fg, text_shadow, SF_FAMILY, win_h_tmp
     );
     UIKit::widget::apply_css(&bar, &css);
@@ -786,6 +1107,74 @@ fn build_bar_content(app_name: &str, scheme: ColorScheme, bar_height: i32) -> gt
 
     bar.append(&octopus_wrap);
     bar.append(&app_wrap);
+
+    // Example app menus (static placeholders, macOS-style).
+    for key in ["menu.file", "menu.edit", "menu.view", "menu.go", "menu.window", "menu.help"] {
+        let lbl = gtk::Label::new(Some(&trk(key)));
+        lbl.add_css_class("menubar-label");
+        lbl.set_halign(gtk::Align::Start);
+        lbl.set_valign(gtk::Align::Center);
+        lbl.set_xalign(0.0);
+        let wrap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        wrap.add_css_class("octopus-wrap");
+        wrap.set_valign(gtk::Align::Center);
+        wrap.set_halign(gtk::Align::Start);
+        wrap.set_hexpand(false);
+        wrap.set_margin_start(2);
+        wrap.set_margin_end(2);
+        wrap.append(&lbl);
+        let motion = gtk::EventControllerMotion::new();
+        let w_h = wrap.clone();
+        motion.connect_enter(move |_, _, _| w_h.add_css_class("octopus-hover"));
+        let w_h2 = wrap.clone();
+        motion.connect_leave(move |_| w_h2.remove_css_class("octopus-hover"));
+        wrap.add_controller(motion);
+        let pop = build_example_menu(&wrap, key);
+        register_top_menu(&wrap, &pop, TopMenuKind::Example(key));
+        bar.append(&wrap);
+    }
+
+    // Spacer pushes the status area to the right edge.
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    bar.append(&spacer);
+
+    // Example status area (macOS-style): icons + clock.
+    let icon_col = if is_dark {
+        IconColor::WHITE
+    } else {
+        IconColor::from_rgb(30, 30, 30)
+    };
+    let status = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    status.set_valign(gtk::Align::Center);
+    status.set_halign(gtk::Align::End);
+    status.set_margin_end(10);
+    for sym in [
+        CoreIcon::SWITCH_2,
+        CoreIcon::MOON_FILL,
+        CoreIcon::BATTERY_100,
+        CoreIcon::WIFI,
+        CoreIcon::MAGNIFYINGGLASS,
+    ] {
+        let cell = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        cell.set_valign(gtk::Align::Center);
+        cell.append(&menu_sf_icon(sym, icon_col));
+        status.append(&cell);
+    }
+    let clock = gtk::Label::new(Some("--"));
+    clock.add_css_class("menubar-label");
+    clock.set_halign(gtk::Align::End);
+    clock.set_valign(gtk::Align::Center);
+    clock.set_xalign(1.0);
+    status.append(&clock);
+    bar.append(&status);
+    update_clock(&clock);
+    let clock_c = clock.clone();
+    glib::timeout_add_local(std::time::Duration::from_secs(20), move || {
+        update_clock(&clock_c);
+        glib::ControlFlow::Continue
+    });
+
     bar.upcast()
 }
 
@@ -872,6 +1261,19 @@ mod x11_place {
         }
         ok
     }
+    /// Never take keyboard focus: clicks/hover still work, but the app
+    /// below keeps _NET_ACTIVE_WINDOW and keyboard focus (shell behavior).
+    /// WM_HINTS = { flags=InputHint, input=False, ... }.
+    pub fn set_no_focus(xid: u32) -> bool {
+        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+        let Some((conn, _)) = connection() else { return false; };
+        const INPUT_HINT: i32 = 1 << 0;
+        const NORMAL_STATE: i32 = 1;
+        let hints = [INPUT_HINT, 0, NORMAL_STATE, 0, 0, 0, 0, 0, 0];
+        let mut value = Vec::with_capacity(36);
+        for v in hints { value.extend_from_slice(&v.to_ne_bytes()); }
+        conn.change_property(PropMode::REPLACE, xid, AtomEnum::WM_HINTS, AtomEnum::WM_HINTS, 32, 9, &value).is_ok()
+    }
     /// Input-Region auf die Bar beschränken (Schatten bleibt visuell, aber klick-transparent).
     pub fn set_input_region(xid: u32, x: i32, y: i32, w: u16, h: u16) -> bool {
         use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
@@ -907,6 +1309,17 @@ mod x11_place {
             if xid != 0 { return Some(xid); }
         }
         None
+    }
+
+    pub fn get_window_pid(xid: u32) -> Option<i32> {
+        let (conn, _) = connection()?;
+        let atom = conn.intern_atom(false, b"_NET_WM_PID").ok()?.reply().ok()?.atom;
+        let prop = conn.get_property(false, xid, atom, x11rb::protocol::xproto::AtomEnum::CARDINAL, 0, 1).ok()?.reply().ok()?;
+        if prop.value.len() >= 4 {
+            Some(i32::from_ne_bytes([prop.value[0], prop.value[1], prop.value[2], prop.value[3]]))
+        } else {
+            None
+        }
     }
 
     pub fn get_client_list() -> Vec<u32> {
@@ -1009,8 +1422,10 @@ mod x11_place {
     pub fn set_dock_type(_: u32) -> bool { false }
     pub fn set_keep_above(_: u32) -> bool { false }
     pub fn disable_shadow(_: u32) -> bool { false }
+    pub fn set_no_focus(_: u32) -> bool { false }
     pub fn set_input_region(_: u32, _: i32, _: i32, _: u16, _: u16) -> bool { false }
     pub fn get_active_window() -> Option<u32> { None }
+    pub fn get_window_pid(_: u32) -> Option<i32> { None }
     pub fn get_client_list() -> Vec<u32> { Vec::new() }
     pub fn get_wm_class(_: u32) -> Option<String> { None }
     pub fn get_active_app_name() -> String { "Finder".to_string() }
@@ -1023,10 +1438,13 @@ mod x11_place {
 /// Erzeuge fuer jeden Monitor ein eigenes, transparentes Fenster oben.
 /// 1:1 Spiegelung — Octopus + selected App-Name (bold), Hover + Menüs.
 fn spawn_bars(app: &Application) {
-    let app_name_initial = x11_place::get_active_app_name();
+    let t0 = std::time::Instant::now();
+    let app_name_initial = selected_app().0;
+    eprintln!("[menubar] selected_app took {:?}", t0.elapsed());
     LAST_APP_NAME.with(|s| *s.borrow_mut() = app_name_initial.clone());
     APP_MENUBAR_STATE.with(|s| s.borrow_mut().clear());
     OCTOPUS_MENUS.with(|s| s.borrow_mut().clear());
+    TOP_MENUS.with(|s| s.borrow_mut().clear());
     let scheme = ColorScheme::detect_system();
     LAST_SCHEME.with(|s| *s.borrow_mut() = Some(scheme));
 
@@ -1041,6 +1459,7 @@ fn spawn_bars(app: &Application) {
     let monitors = display.monitors();
     let n = monitors.n_items();
     println!("[menubar] spawning {} bar(s), scheme={:?}, app='{}'", n.max(1), scheme, app_name_initial);
+    eprintln!("[menubar] pre-spawn took {:?}", t0.elapsed());
 
     // Falle n == 0 (headless) -> ein Dummy-Fenster
     let count = if n == 0 { 1 } else { n };
@@ -1086,6 +1505,9 @@ fn spawn_bars(app: &Application) {
         win.set_decorated(false);
         win.set_resizable(false);
         win.set_overflow(gtk::Overflow::Visible);
+        // Shell behavior: never steal keyboard focus from the app below,
+        // pointer events (click/hover) keep working.
+        win.set_focusable(false);
 
         let content = build_bar_content(&app_name_initial, scheme, logical_h);
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1098,6 +1520,31 @@ fn spawn_bars(app: &Application) {
         win.set_child(Some(&root));
 
         win.set_size_request(logical_w, win_h);
+
+        // Wayland layer-shell: pin the bar to the top edge with an exclusive
+        // zone. The compositor then places it at (0,0) full-width, keeps it
+        // above normal windows and blends its alpha (translucency). On X11
+        // (XWayland fallback) this is skipped and the X11 self-positioning
+        // below takes over instead.
+        let wayland_first = std::env::var("GDK_BACKEND")
+            .map(|v| {
+                v.split(',')
+                    .next()
+                    .map(|s| s.trim() == "wayland")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if wayland_first {
+            use gtk4_layer_shell::LayerShell;
+            win.init_layer_shell();
+            win.set_layer(gtk4_layer_shell::Layer::Top);
+            win.set_anchor(gtk4_layer_shell::Edge::Top, true);
+            win.set_anchor(gtk4_layer_shell::Edge::Left, true);
+            win.set_anchor(gtk4_layer_shell::Edge::Right, true);
+            win.set_anchor(gtk4_layer_shell::Edge::Bottom, false);
+            win.set_exclusive_zone(win_h);
+            win.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+        }
 
         // Present zuerst, dann X11-Move (Surface existiert erst nach Realize)
         win.present();
@@ -1113,6 +1560,7 @@ fn spawn_bars(app: &Application) {
                     x11_place::move_window(xid, phys_x, phys_y);
                     x11_place::set_dock_type(xid);
                     x11_place::disable_shadow(xid);
+                    x11_place::set_no_focus(xid);
                     x11_place::set_keep_above(xid);
                     let scale = win_clone.scale_factor().max(1);
                     x11_place::set_input_region(xid, 0, 0, (logical_w_c * scale) as u16, (logical_h_c * scale) as u16);
@@ -1129,6 +1577,7 @@ fn spawn_bars(app: &Application) {
                 if let Some(xid) = x11_place::xid_of(&surface) {
                     x11_place::move_window(xid, phys_x, phys_y);
                     x11_place::disable_shadow(xid);
+                    x11_place::set_no_focus(xid);
                     let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, logical_w2, logical_h2));
                     surface.set_input_region(&region);
                 }
@@ -1146,7 +1595,7 @@ fn spawn_bars(app: &Application) {
     {
         let last_cell = std::rc::Rc::new(std::cell::RefCell::new(app_name_initial.clone()));
         glib::timeout_add_local(std::time::Duration::from_millis(400), move || {
-            let cur = x11_place::get_active_app_name();
+            let cur = selected_app().0;
             let mut last = last_cell.borrow_mut();
             if *last != cur {
                 *last = cur.clone();
@@ -1220,6 +1669,8 @@ fn main() {
     if std::env::var("GDK_BACKEND").is_err() {
         std::env::set_var("GDK_BACKEND", "x11");
     }
+
+    init_i18n();
 
     let app = Application::builder()
         .application_id("org.tontoo.menubar")
