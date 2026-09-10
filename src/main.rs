@@ -42,6 +42,8 @@ thread_local! {
     static OCTOPUS_MENUS: std::cell::RefCell<Vec<gtk::Popover>> = std::cell::RefCell::new(Vec::new());
     static LAST_SCHEME: std::cell::RefCell<Option<ColorScheme>> = std::cell::RefCell::new(None);
     static TOP_MENUS: std::cell::RefCell<Vec<(gtk::Box, gtk::Popover, TopMenuKind)>> = std::cell::RefCell::new(Vec::new());
+    static BAR_WINDOWS: std::cell::RefCell<Vec<ApplicationWindow>> = std::cell::RefCell::new(Vec::new());
+    static ZOOMED_WINDOWS: std::cell::RefCell<std::collections::HashSet<u64>> = std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// Kind of a top-level menubar menu (trigger wrap + popover).
@@ -226,6 +228,11 @@ fn install_transparent_css() {
                 font-weight: 400;
                 color: #F5F5F7;
             }}
+            /* App name is bold: same provider + later rule beats .menubar-label. */
+            .menubar-label.app-name-label {{
+                font-weight: 800;
+                letter-spacing: -0.2px;
+            }}
             .menubar-octopus {{
                 background: transparent;
                 box-shadow: none;
@@ -289,6 +296,25 @@ fn install_transparent_css() {
             }}
             .octopus-menu.light .octopus-menu-item:active {{
                 background: rgba(0,0,0,0.12);
+            }}
+            /* Disabled rows (e.g. Force Quit / Quit with no real app selected) */
+            .octopus-menu-item:disabled {{
+                background: transparent;
+            }}
+            .octopus-menu-item:disabled .octopus-menu-label {{
+                color: rgba(245,245,247,0.35);
+            }}
+            .octopus-menu.light .octopus-menu-item:disabled .octopus-menu-label {{
+                color: rgba(30,30,30,0.35);
+            }}
+            .octopus-menu-item:disabled .octopus-menu-shortcut {{
+                color: rgba(245,245,247,0.25);
+            }}
+            .octopus-menu.light .octopus-menu-item:disabled .octopus-menu-shortcut {{
+                color: rgba(30,30,30,0.25);
+            }}
+            .octopus-menu-item:disabled .octopus-menu-icon {{
+                opacity: 0.35;
             }}
             .octopus-menu-label {{
                 color: #F5F5F7;
@@ -516,29 +542,67 @@ fn build_octopus_menu(parent: &impl IsA<gtk::Widget>) -> gtk::Popover {
     popover
 }
 
-/// Launch ~/Applications/SystemOverview.app via the tapp runner.
+/// Launch a .app bundle via the tapp runner, with optional extra arguments
+/// (e.g. `tapp /System/Applications/AboutThisApp.app /path/to/Steam.app`).
 /// TApp is always installed on the machine, so /usr/bin/tapp exists.
-fn launch_system_overview() {
+fn launch_via_tapp(bundle: &str, args: &[String]) -> bool {
     const TAPP: &str = "/usr/bin/tapp";
-    let Ok(home) = std::env::var("HOME") else {
-        eprintln!("[menubar] cannot launch SystemOverview: $HOME not set");
-        return;
-    };
-    let bundle = format!("{home}/Applications/SystemOverview.app");
-    if !std::path::Path::new(&bundle).exists() {
-        eprintln!("[menubar] SystemOverview not found at {bundle}");
-        return;
+    if !std::path::Path::new(bundle).exists() {
+        eprintln!("[menubar] bundle not found: {bundle}");
+        return false;
     }
-    match std::process::Command::new(TAPP)
-        .arg(&bundle)
+    let mut cmd = std::process::Command::new(TAPP);
+    cmd.arg(bundle);
+    for a in args {
+        cmd.arg(a);
+    }
+    match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(_) => println!("[menubar] launched SystemOverview via tapp"),
-        Err(e) => eprintln!("[menubar] tapp launch failed: {e}"),
+        Ok(_) => {
+            println!("[menubar] launched {bundle} via tapp");
+            true
+        }
+        Err(e) => {
+            eprintln!("[menubar] tapp launch of {bundle} failed: {e}");
+            false
+        }
     }
+}
+
+/// Launch ~/Applications/SystemOverview.app via the tapp runner.
+fn launch_system_overview() {
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("[menubar] cannot launch SystemOverview: $HOME not set");
+        return;
+    };
+    launch_via_tapp(&format!("{home}/Applications/SystemOverview.app"), &[]);
+}
+
+/// .app bundle path of the selected app, if it runs from a real bundle
+/// (CoreWindows classification). Plain binaries have no bundle path.
+fn selected_app_bundle() -> Option<String> {
+    let pid = x11_place::get_active_window().and_then(x11_place::get_window_pid)?;
+    if !daemon_reachable() {
+        return None;
+    }
+    let raws = WindowsProvider::from_env().list_raw().ok()?;
+    let raw = raws.iter().find(|w| w.pid == Some(pid))?;
+    CoreWindows::classify(raw)
+        .bundle_dir
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Open AboutThisApp for the selected app:
+/// `tapp /System/Applications/AboutThisApp.app <bundle path>`.
+/// Without a known bundle path, AboutThisApp still opens (no argument).
+fn open_about_this_app() {
+    const ABOUT: &str = "/System/Applications/AboutThisApp.app";
+    let extra = selected_app_bundle().map(|b| vec![b]).unwrap_or_default();
+    launch_via_tapp(ABOUT, &extra);
 }
 
 /// Fast reachability probe for the window daemon.
@@ -562,6 +626,57 @@ fn corewindows_windows() -> Option<Vec<CoreWindows::WindowInfo>> {
         return None;
     }
     WindowsProvider::from_env().windows().ok()
+}
+
+/// Shell windows (menubar/dock) are never shown as the app name:
+/// the bar keeps displaying the last real app instead.
+fn is_shell_name(name: &str) -> bool {
+    matches!(name.trim().to_lowercase().as_str(), "menubar" | "dock" | "")
+}
+
+/// True while the pointer is over one of our bar windows.
+fn pointer_over_bar() -> bool {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return false;
+    };
+    let Some(pointer) = display.default_seat().and_then(|s| s.pointer()) else {
+        return false;
+    };
+    let (surf_opt, _, _) = pointer.surface_at_position();
+    let Some(surf) = surf_opt else {
+        return false;
+    };
+    BAR_WINDOWS.with(|w| {
+        w.borrow()
+            .iter()
+            .any(|win| win.surface().as_ref() == Some(&surf))
+    })
+}
+
+/// Bar display name: the selected app, but shell windows never appear.
+/// Clicking the menubar keeps the previous app shown; only focusing a
+/// real window changes the text.
+fn bar_app_name() -> String {
+    // Clicking the bar can unfocus the app without focusing anything new:
+    // while the pointer is over the bar, keep the last real app instead
+    // of falling back to "Finder".
+    if x11_place::get_active_window().is_none() && pointer_over_bar() {
+        let last = LAST_APP_NAME.with(|s| s.borrow().clone());
+        if !last.trim().is_empty() {
+            return last;
+        }
+    }
+    let cur = selected_app().0;
+    if is_shell_name(&cur) {
+        let last = LAST_APP_NAME.with(|s| s.borrow().clone());
+        if last.trim().is_empty() {
+            "Finder".to_string()
+        } else {
+            last
+        }
+    } else {
+        cur
+    }
 }
 
 /// Selected app as (display name, pid).
@@ -661,6 +776,73 @@ fn quit_current_app() {
     }
 }
 
+/// Daemon id of the focused window: match active pid + title,
+/// else first window of the active pid. None when unreachable.
+fn focused_daemon_window() -> Option<u64> {
+    let xid = x11_place::get_active_window()?;
+    let pid = x11_place::get_window_pid(xid)?;
+    let windows = corewindows_windows()?;
+    let own: Vec<&CoreWindows::WindowInfo> =
+        windows.iter().filter(|w| w.pid == Some(pid)).collect();
+    if own.is_empty() {
+        return None;
+    }
+    if let Some(title) = x11_place::get_window_title(xid) {
+        if let Some(w) = own.iter().find(|w| w.title.as_deref() == Some(title.as_str())) {
+            return Some(w.id);
+        }
+    }
+    own.first().map(|w| w.id)
+}
+
+/// Minimize the focused window. X11 fallback when the daemon is unreachable.
+fn minimize_focused_window() {
+    if let Some(id) = focused_daemon_window() {
+        if WindowsProvider::from_env().minimize_window(id).is_ok() {
+            return;
+        }
+    }
+    if let Some(xid) = x11_place::get_active_window() {
+        x11_place::minimize_window(xid);
+    }
+}
+
+/// Gracefully close the focused window. X11 fallback when unreachable.
+fn close_focused_window() {
+    if let Some(id) = focused_daemon_window() {
+        if WindowsProvider::from_env().close_window(id).is_ok() {
+            return;
+        }
+    }
+    if let Some(xid) = x11_place::get_active_window() {
+        x11_place::close_window(xid);
+    }
+}
+
+/// Toggle fullscreen (Zoom) on the focused window.
+/// The daemon has no fullscreen getter, so zoomed ids are tracked locally.
+/// X11 fallback toggles via EWMH directly.
+fn toggle_zoom_focused_window() {
+    if let Some(id) = focused_daemon_window() {
+        let provider = WindowsProvider::from_env();
+        let zoomed = ZOOMED_WINDOWS.with(|s| s.borrow().contains(&id));
+        if provider.set_fullscreen(id, !zoomed).is_ok() {
+            ZOOMED_WINDOWS.with(|s| {
+                let mut set = s.borrow_mut();
+                if zoomed {
+                    set.remove(&id);
+                } else {
+                    set.insert(id);
+                }
+            });
+            return;
+        }
+    }
+    if let Some(xid) = x11_place::get_active_window() {
+        x11_place::toggle_fullscreen(xid);
+    }
+}
+
 /// Force quit the selected app (SIGKILL, no save dialog).
 /// Never touches the menubar or dock themselves.
 fn force_quit_current_app() {
@@ -707,13 +889,16 @@ fn set_octopus_menu_content(popover: &gtk::Popover) {
     enum OctopusAction {
         None,
         OpenSystemOverview,
+        OpenSystemSettings,
         ForceQuitActive,
     }
 
     let user = std::env::var("USER").unwrap_or_else(|_| "liveuser".to_string());
+    // With no real app selected (bar shows "Finder"), Force Quit is disabled.
+    let quit_enabled = bar_app_name() != "Finder";
     let entries: Vec<Entry> = vec![
         Entry { label: trk("menu.about"), icon: Some(CoreIcon::DESKTOPCOMPUTER), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::OpenSystemOverview },
-        Entry { label: trk("menu.settings"), icon: Some(CoreIcon::GEARSHAPE_FILL), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::None },
+        Entry { label: trk("menu.settings"), icon: Some(CoreIcon::GEARSHAPE_FILL), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::OpenSystemSettings },
         Entry { label: trk("menu.appstore"), icon: Some(CoreIcon::APP_FILL), shortcut: None, arrow: false, sep_before: false, action: OctopusAction::None },
         Entry { label: trk("menu.recent"), icon: Some(CoreIcon::CLOCK_FILL), shortcut: None, arrow: true, sep_before: false, action: OctopusAction::None },
         Entry { label: trk("menu.forcequit"), icon: Some(CoreIcon::XMARK_OCTAGON_FILL), shortcut: Some("⌥⌘⎋"), arrow: false, sep_before: true, action: OctopusAction::ForceQuitActive },
@@ -734,10 +919,19 @@ fn set_octopus_menu_content(popover: &gtk::Popover) {
         row.add_css_class("octopus-menu-item");
         row.set_halign(gtk::Align::Fill);
         row.set_hexpand(true);
+        // Force Quit is disabled with no real app selected (grayed out).
+        let row_enabled = !matches!(e.action, OctopusAction::ForceQuitActive) || quit_enabled;
+        if !row_enabled {
+            row.set_sensitive(false);
+        }
         // Hover-Effekt via CSS :hover — zusätzlich Motion-Controller für Klasse
         let motion = gtk::EventControllerMotion::new();
         let row_c = row.clone();
-        motion.connect_enter(move |_, _, _| row_c.add_css_class("hovered"));
+        motion.connect_enter(move |_, _, _| {
+            if row_c.is_sensitive() {
+                row_c.add_css_class("hovered");
+            }
+        });
         let row_c2 = row.clone();
         motion.connect_leave(move |_| row_c2.remove_css_class("hovered"));
         row.add_controller(motion);
@@ -777,9 +971,16 @@ fn set_octopus_menu_content(popover: &gtk::Popover) {
         let act = e.action;
         let pop_c = popover.clone();
         gesture.connect_pressed(move |_, _, _, _| {
+            if !row_enabled {
+                return;
+            }
             match act {
                 OctopusAction::OpenSystemOverview => {
                     launch_system_overview();
+                    pop_c.popdown();
+                }
+                OctopusAction::OpenSystemSettings => {
+                    launch_via_tapp("/System/Applications/systemsettings.app", &[]);
                     pop_c.popdown();
                 }
                 OctopusAction::ForceQuitActive => {
@@ -827,12 +1028,13 @@ fn set_app_menu_content(popover: &gtk::Popover, app_name: &str) {
         action: AppAction,
     }
     #[derive(Clone, Copy)]
-    enum AppAction { HideCurrent, HideOthers, Quit }
+    enum AppAction { HideCurrent, HideOthers, AboutApp, Quit }
 
     let entries: Vec<Entry> = vec![
         Entry { label: trk_args("menu.hide_app", &[("app", app_name)]), icon: Some(CoreIcon::EYE_SLASH_FILL), action: AppAction::HideCurrent },
         Entry { label: trk("menu.hide_others"), icon: Some(CoreIcon::EYE_SLASH), action: AppAction::HideOthers },
-        // separator vor Quit
+        // separator vor About/Quit (same category)
+        Entry { label: trk_args("menu.about_app", &[("app", app_name)]), icon: Some(CoreIcon::INFO_CIRCLE), action: AppAction::AboutApp },
         Entry { label: trk_args("menu.quit_app", &[("app", app_name)]), icon: Some(CoreIcon::XMARK), action: AppAction::Quit },
     ];
 
@@ -846,9 +1048,18 @@ fn set_app_menu_content(popover: &gtk::Popover, app_name: &str) {
         row.add_css_class("octopus-menu-item");
         row.set_halign(gtk::Align::Fill);
         row.set_hexpand(true);
+        // Quit is disabled with no real app selected (grayed out).
+        let row_enabled = !matches!(e.action, AppAction::Quit) || app_name != "Finder";
+        if !row_enabled {
+            row.set_sensitive(false);
+        }
         let motion = gtk::EventControllerMotion::new();
         let row_c = row.clone();
-        motion.connect_enter(move |_, _, _| row_c.add_css_class("hovered"));
+        motion.connect_enter(move |_, _, _| {
+            if row_c.is_sensitive() {
+                row_c.add_css_class("hovered");
+            }
+        });
         let row_c2 = row.clone();
         motion.connect_leave(move |_| row_c2.remove_css_class("hovered"));
         row.add_controller(motion);
@@ -875,9 +1086,13 @@ fn set_app_menu_content(popover: &gtk::Popover, app_name: &str) {
         gesture.set_button(1);
         let pop_clone = popover.clone();
         gesture.connect_pressed(move |_, _, _, _| {
+            if !row_enabled {
+                return;
+            }
             match act {
                 AppAction::HideCurrent => hide_current_app(),
                 AppAction::HideOthers => hide_other_apps(),
+                AppAction::AboutApp => open_about_this_app(),
                 AppAction::Quit => quit_current_app(),
             }
             pop_clone.popdown();
@@ -895,8 +1110,7 @@ fn refresh_top_menu(popover: &gtk::Popover, kind: TopMenuKind) {
     match kind {
         TopMenuKind::Octopus => set_octopus_menu_content(popover),
         TopMenuKind::App => {
-            let cur = selected_app().0;
-            set_app_menu_content(popover, &cur);
+            set_app_menu_content(popover, &bar_app_name());
         }
         TopMenuKind::Example(title) => set_example_menu_content(popover, title),
     }
@@ -970,23 +1184,82 @@ fn build_example_menu(parent: &impl IsA<gtk::Widget>, title: &'static str) -> gt
     popover
 }
 
-fn set_example_menu_content(popover: &gtk::Popover, _title: &str) {
+fn set_example_menu_content(popover: &gtk::Popover, menu_key: &str) {
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
     menu.add_css_class("octopus-menu");
     menu.set_halign(gtk::Align::Start);
     menu.set_valign(gtk::Align::Start);
     let is_dark = ColorScheme::detect_system() == ColorScheme::Dark;
+    let icon_col = if is_dark {
+        IconColor::WHITE
+    } else {
+        IconColor::from_rgb(30, 30, 30)
+    };
     if is_dark {
         menu.remove_css_class("light");
     } else {
         menu.add_css_class("light");
     }
 
-    for (idx, key) in ["menu.example1", "menu.example2", "menu.example3"]
-        .iter()
-        .enumerate()
-    {
-        if idx == 2 {
+    struct ExampleRow {
+        key: &'static str,
+        icon: Option<SFSymbol>,
+        arrow: bool,
+        sep_before: bool,
+        action: ExampleAction,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExampleAction {
+        None,
+        MinimizeWindow,
+        ToggleZoom,
+        CloseWindow,
+    }
+
+    // Per-menu rows (macOS-style), no shortcuts shown.
+    let rows: Vec<ExampleRow> = match menu_key {
+        "menu.edit" => vec![
+            ExampleRow { key: "menu.edit_undo", icon: Some(CoreIcon::ARROW_UTURN_BACKWARD), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.edit_redo", icon: Some(CoreIcon::ARROW_UTURN_FORWARD), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.edit_cut", icon: Some(CoreIcon::SCISSORS), arrow: false, sep_before: true, action: ExampleAction::None },
+            ExampleRow { key: "menu.edit_copy", icon: Some(CoreIcon::DOC_ON_DOC), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.edit_paste", icon: Some(CoreIcon::DOC_ON_CLIPBOARD), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.edit_selectall", icon: Some(CoreIcon::SQUARE_DASHED), arrow: false, sep_before: true, action: ExampleAction::None },
+        ],
+        "menu.view" => vec![
+            ExampleRow { key: "menu.view_zoomin", icon: Some(CoreIcon::PLUS_MAGNIFYINGGLASS), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.view_zoomout", icon: Some(CoreIcon::MINUS_MAGNIFYINGGLASS), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.view_refresh", icon: Some(CoreIcon::ARROW_CLOCKWISE), arrow: false, sep_before: false, action: ExampleAction::None },
+        ],
+        "menu.go" => vec![
+            ExampleRow { key: "menu.go_back", icon: Some(CoreIcon::CHEVRON_BACKWARD), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_forward", icon: Some(CoreIcon::CHEVRON_FORWARD), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_recents", icon: Some(CoreIcon::CLOCK), arrow: false, sep_before: true, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_documents", icon: Some(CoreIcon::FOLDER), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_desktop", icon: Some(CoreIcon::FOLDER), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_downloads", icon: Some(CoreIcon::FOLDER), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_home", icon: Some(CoreIcon::HOUSE), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_computer", icon: Some(CoreIcon::DESKTOPCOMPUTER), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_applications", icon: Some(CoreIcon::FOLDER), arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_recentfolders", icon: Some(CoreIcon::FOLDER_FILL), arrow: true, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.go_tofolder", icon: Some(CoreIcon::FOLDER_FILL), arrow: false, sep_before: true, action: ExampleAction::None },
+        ],
+        "menu.window" => vec![
+            ExampleRow { key: "menu.win_minimize", icon: Some(CoreIcon::MINUS), arrow: false, sep_before: false, action: ExampleAction::MinimizeWindow },
+            ExampleRow { key: "menu.win_zoom", icon: Some(CoreIcon::ARROW_UP_LEFT_AND_ARROW_DOWN_RIGHT), arrow: false, sep_before: false, action: ExampleAction::ToggleZoom },
+            ExampleRow { key: "menu.win_close", icon: Some(CoreIcon::XMARK), arrow: false, sep_before: false, action: ExampleAction::CloseWindow },
+            ExampleRow { key: "menu.win_front", icon: Some(CoreIcon::SQUARE_STACK), arrow: false, sep_before: true, action: ExampleAction::None },
+        ],
+        _ => vec![
+            ExampleRow { key: "menu.example1", icon: None, arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.example2", icon: None, arrow: false, sep_before: false, action: ExampleAction::None },
+            ExampleRow { key: "menu.example3", icon: None, arrow: false, sep_before: true, action: ExampleAction::None },
+        ],
+    };
+
+    for e in rows {
+        if e.sep_before {
             let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
             sep.add_css_class("octopus-sep");
             menu.append(&sep);
@@ -1002,13 +1275,45 @@ fn set_example_menu_content(popover: &gtk::Popover, _title: &str) {
         motion.connect_leave(move |_| row_c2.remove_css_class("hovered"));
         row.add_controller(motion);
 
-        let lbl = gtk::Label::new(Some(&trk(key)));
+        if let Some(sym) = e.icon {
+            let icon_w = menu_sf_icon(sym, icon_col);
+            icon_w.set_margin_start(4);
+            row.append(&icon_w);
+        } else {
+            let sp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            sp.set_size_request(16, 16);
+            row.append(&sp);
+        }
+
+        let lbl = gtk::Label::new(Some(&trk(e.key)));
         lbl.add_css_class("octopus-menu-label");
         lbl.set_halign(gtk::Align::Start);
         lbl.set_hexpand(true);
         lbl.set_xalign(0.0);
-        lbl.set_margin_start(4);
         row.append(&lbl);
+
+        if e.arrow {
+            let arrow = gtk::Label::new(Some("›"));
+            arrow.add_css_class("octopus-menu-shortcut");
+            arrow.set_margin_start(8);
+            row.append(&arrow);
+        }
+
+        let act = e.action;
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(1);
+        let pop_c = popover.clone();
+        gesture.connect_pressed(move |_, _, _, _| {
+            match act {
+                ExampleAction::MinimizeWindow => minimize_focused_window(),
+                ExampleAction::ToggleZoom => toggle_zoom_focused_window(),
+                ExampleAction::CloseWindow => close_focused_window(),
+                ExampleAction::None => {}
+            }
+            pop_c.popdown();
+        });
+        row.add_controller(gesture);
+
         menu.append(&row);
     }
 
@@ -1129,8 +1434,11 @@ fn build_bar_content(app_name: &str, scheme: ColorScheme, bar_height: i32) -> gt
         let w_h2 = wrap.clone();
         motion.connect_leave(move |_| w_h2.remove_css_class("octopus-hover"));
         wrap.add_controller(motion);
-        let pop = build_example_menu(&wrap, key);
-        register_top_menu(&wrap, &pop, TopMenuKind::Example(key));
+        // Help has no menu yet: title with hover only.
+        if key != "menu.help" {
+            let pop = build_example_menu(&wrap, key);
+            register_top_menu(&wrap, &pop, TopMenuKind::Example(key));
+        }
         bar.append(&wrap);
     }
 
@@ -1140,11 +1448,8 @@ fn build_bar_content(app_name: &str, scheme: ColorScheme, bar_height: i32) -> gt
     bar.append(&spacer);
 
     // Example status area (macOS-style): icons + clock.
-    let icon_col = if is_dark {
-        IconColor::WHITE
-    } else {
-        IconColor::from_rgb(30, 30, 30)
-    };
+    // Status icons are always white: the top shadow keeps them readable.
+    let icon_col = IconColor::WHITE;
     let status = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     status.set_valign(gtk::Align::Center);
     status.set_halign(gtk::Align::End);
@@ -1358,6 +1663,7 @@ mod x11_place {
                     if cap.to_lowercase() != "menubar" && cap.to_lowercase() != "dock" {
                         return cap;
                     }
+                    return "Finder".to_string();
                 }
                 return cls;
             }
@@ -1377,6 +1683,30 @@ mod x11_place {
         if prop.value.is_empty() { return None; }
         let s = String::from_utf8_lossy(&prop.value).trim().to_string();
         if s.is_empty() { None } else { Some(s) }
+    }
+
+    pub fn get_window_title(xid: u32) -> Option<String> {
+        get_net_wm_name(xid)
+    }
+
+    /// Toggle fullscreen via EWMH (_NET_WM_STATE_TOGGLE).
+    pub fn toggle_fullscreen(xid: u32) -> bool {
+        let Some((conn, screen)) = connection() else { return false; };
+        let root = conn.setup().roots[*screen].root;
+        let wm_state = match conn.intern_atom(false, b"_NET_WM_STATE").ok().and_then(|c| c.reply().ok()) { Some(r) => r.atom, None => return false };
+        let fs = match conn.intern_atom(false, b"_NET_WM_STATE_FULLSCREEN").ok().and_then(|c| c.reply().ok()) { Some(r) => r.atom, None => return false };
+        // data[0] = _NET_WM_STATE_TOGGLE (2), data[1] = fullscreen atom
+        let data = x11rb::protocol::xproto::ClientMessageData::from([2u32, fs, 0, 0, 0]);
+        let event = x11rb::protocol::xproto::ClientMessageEvent {
+            response_type: x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT,
+            sequence: 0,
+            window: xid,
+            type_: wm_state,
+            format: 32,
+            data,
+        };
+        let mask = x11rb::protocol::xproto::EventMask::SUBSTRUCTURE_REDIRECT | x11rb::protocol::xproto::EventMask::SUBSTRUCTURE_NOTIFY;
+        conn.send_event(false, root, mask, event).is_ok() && conn.flush().is_ok()
     }
 
     pub fn minimize_window(xid: u32) -> bool {
@@ -1426,11 +1756,13 @@ mod x11_place {
     pub fn set_input_region(_: u32, _: i32, _: i32, _: u16, _: u16) -> bool { false }
     pub fn get_active_window() -> Option<u32> { None }
     pub fn get_window_pid(_: u32) -> Option<i32> { None }
+    pub fn get_window_title(_: u32) -> Option<String> { None }
     pub fn get_client_list() -> Vec<u32> { Vec::new() }
     pub fn get_wm_class(_: u32) -> Option<String> { None }
     pub fn get_active_app_name() -> String { "Finder".to_string() }
     pub fn minimize_window(_: u32) -> bool { false }
     pub fn close_window(_: u32) -> bool { false }
+    pub fn toggle_fullscreen(_: u32) -> bool { false }
 }
 
 // ── Per-Monitor Fenster ────────────────────────────────────────────────
@@ -1439,12 +1771,14 @@ mod x11_place {
 /// 1:1 Spiegelung — Octopus + selected App-Name (bold), Hover + Menüs.
 fn spawn_bars(app: &Application) {
     let t0 = std::time::Instant::now();
-    let app_name_initial = selected_app().0;
+    let app_name_initial = bar_app_name();
     eprintln!("[menubar] selected_app took {:?}", t0.elapsed());
     LAST_APP_NAME.with(|s| *s.borrow_mut() = app_name_initial.clone());
     APP_MENUBAR_STATE.with(|s| s.borrow_mut().clear());
     OCTOPUS_MENUS.with(|s| s.borrow_mut().clear());
     TOP_MENUS.with(|s| s.borrow_mut().clear());
+    BAR_WINDOWS.with(|s| s.borrow_mut().clear());
+    ZOOMED_WINDOWS.with(|s| s.borrow_mut().clear());
     let scheme = ColorScheme::detect_system();
     LAST_SCHEME.with(|s| *s.borrow_mut() = Some(scheme));
 
@@ -1591,11 +1925,14 @@ fn spawn_bars(app: &Application) {
         windows.borrow_mut().push(win);
     }
 
+    // Mirror bar windows for the pointer-over-bar check (sticky app name).
+    BAR_WINDOWS.with(|b| *b.borrow_mut() = windows.borrow().clone());
+
     // Live-Update: selected App alle 400ms pollen (WM_CLASS, nicht Titel)
     {
         let last_cell = std::rc::Rc::new(std::cell::RefCell::new(app_name_initial.clone()));
         glib::timeout_add_local(std::time::Duration::from_millis(400), move || {
-            let cur = selected_app().0;
+            let cur = bar_app_name();
             let mut last = last_cell.borrow_mut();
             if *last != cur {
                 *last = cur.clone();
@@ -1624,7 +1961,7 @@ fn spawn_bars(app: &Application) {
                         set_octopus_menu_content(pop);
                     }
                 });
-                let cur_app = x11_place::get_active_app_name();
+                let cur_app = bar_app_name();
                 APP_MENUBAR_STATE.with(|state| {
                     for (_, pop) in state.borrow().iter() {
                         set_app_menu_content(pop, &cur_app);
