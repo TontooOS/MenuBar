@@ -573,8 +573,20 @@ fn launch_via_tapp(bundle: &str, args: &[String]) -> bool {
     }
 }
 
-/// Launch ~/Applications/SystemOverview.app via the tapp runner.
+/// Launch SystemOverview via the tapp runner.
+/// Primary path is the system-wide link `/Applications/SystemOverview.app`,
+/// with fallbacks to the bundle directly and the legacy per-user link.
 fn launch_system_overview() {
+    const SYSTEM_LINK: &str = "/Applications/SystemOverview.app";
+    const BUNDLE: &str = "/System/Applications/systemoverview.app";
+    if std::path::Path::new(SYSTEM_LINK).exists() {
+        launch_via_tapp(SYSTEM_LINK, &[]);
+        return;
+    }
+    if std::path::Path::new(BUNDLE).exists() {
+        launch_via_tapp(BUNDLE, &[]);
+        return;
+    }
     let Ok(home) = std::env::var("HOME") else {
         eprintln!("[menubar] cannot launch SystemOverview: $HOME not set");
         return;
@@ -1771,6 +1783,12 @@ mod x11_place {
 /// 1:1 Spiegelung — Octopus + selected App-Name (bold), Hover + Menüs.
 fn spawn_bars(app: &Application) {
     let t0 = std::time::Instant::now();
+    eprintln!(
+        "[menubar] backend={:?} wayland_display={:?} display={:?}",
+        std::env::var("GDK_BACKEND").unwrap_or_default(),
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
+        std::env::var("DISPLAY").unwrap_or_default()
+    );
     let app_name_initial = bar_app_name();
     eprintln!("[menubar] selected_app took {:?}", t0.elapsed());
     LAST_APP_NAME.with(|s| *s.borrow_mut() = app_name_initial.clone());
@@ -1883,13 +1901,21 @@ fn spawn_bars(app: &Application) {
         // Present zuerst, dann X11-Move (Surface existiert erst nach Realize)
         win.present();
 
-        // OS-Shadow bleibt deaktiviert (kein eigener Shadow); Höhe per Monitor
+        // X11 self-positioning only on real X11 surfaces: calling the X11
+        // xid lookup on a Wayland surface is invalid. On Wayland the
+        // layer-shell pinning above already placed the bar.
+        let wayland_surface = wayland_first;
         let win_clone = win.clone();
         let logical_w_c = logical_w;
         let logical_h_c = logical_h;
         glib::idle_add_local_once(move || {
             if let Some(surface) = win_clone.surface() {
-                if let Some(xid) = x11_place::xid_of(&surface) {
+                let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, logical_w_c, logical_h_c));
+                surface.set_input_region(&region);
+                if wayland_surface {
+                    eprintln!("[menubar] bar on wayland layer-shell, input region set");
+                } else if let Some(xid) = x11_place::xid_of(&surface) {
+                    eprintln!("[menubar] bar on x11, xid={xid}");
                     x11_place::set_position_hints(xid, phys_x, phys_y);
                     x11_place::move_window(xid, phys_x, phys_y);
                     x11_place::set_dock_type(xid);
@@ -1898,8 +1924,6 @@ fn spawn_bars(app: &Application) {
                     x11_place::set_keep_above(xid);
                     let scale = win_clone.scale_factor().max(1);
                     x11_place::set_input_region(xid, 0, 0, (logical_w_c * scale) as u16, (logical_h_c * scale) as u16);
-                    let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, logical_w_c, logical_h_c));
-                    surface.set_input_region(&region);
                 }
             }
         });
@@ -1908,12 +1932,14 @@ fn spawn_bars(app: &Application) {
         let logical_h2 = logical_h;
         glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
             if let Some(surface) = win2.surface() {
-                if let Some(xid) = x11_place::xid_of(&surface) {
-                    x11_place::move_window(xid, phys_x, phys_y);
-                    x11_place::disable_shadow(xid);
-                    x11_place::set_no_focus(xid);
-                    let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, logical_w2, logical_h2));
-                    surface.set_input_region(&region);
+                let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, logical_w2, logical_h2));
+                surface.set_input_region(&region);
+                if !wayland_surface {
+                    if let Some(xid) = x11_place::xid_of(&surface) {
+                        x11_place::move_window(xid, phys_x, phys_y);
+                        x11_place::disable_shadow(xid);
+                        x11_place::set_no_focus(xid);
+                    }
                 }
             }
         });
