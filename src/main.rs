@@ -598,12 +598,16 @@ fn launch_system_overview() {
 /// (CoreWindows classification). Plain binaries have no bundle path.
 fn selected_app_bundle() -> Option<String> {
     let pid = x11_place::get_active_window().and_then(x11_place::get_window_pid)?;
-    if !daemon_reachable() {
-        return None;
-    }
-    let raws = WindowsProvider::from_env().list_raw().ok()?;
-    let raw = raws.iter().find(|w| w.pid == Some(pid))?;
-    CoreWindows::classify(raw)
+    let windows = cached_windows()?;
+    let w = windows.iter().find(|w| w.pid == Some(pid))?;
+    let raw = CoreWindows::RawWindow {
+        id: w.id,
+        app_id: w.app_id.clone(),
+        title: w.title.clone(),
+        pid: w.pid,
+        minimized: w.minimized,
+    };
+    CoreWindows::classify(&raw)
         .bundle_dir
         .map(|p| p.to_string_lossy().to_string())
 }
@@ -631,13 +635,76 @@ fn daemon_reachable() -> bool {
     std::os::unix::net::UnixStream::connect(&path).is_ok()
 }
 
-/// Daemon window list, but only when the daemon answers immediately.
+struct DaemonCache {
+    windows: Vec<CoreWindows::WindowInfo>,
+    last_ok: Option<std::time::Instant>,
+}
+
+fn daemon_cache() -> &'static std::sync::Mutex<DaemonCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<DaemonCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::sync::Mutex::new(DaemonCache {
+            windows: Vec::new(),
+            last_ok: None,
+        })
+    })
+}
+
+/// Background daemon poller (off the main thread): a hung daemon must never
+/// freeze the bar — the lib blocks up to 10s per call. Started once.
+fn start_daemon_poller() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("menubar-daemon-poll".to_string())
+        .spawn(|| {
+            let mut last_warn: Option<std::time::Instant> = None;
+            loop {
+                if daemon_reachable() {
+                    match WindowsProvider::from_env().windows() {
+                        Ok(ws) => {
+                            if let Ok(mut c) = daemon_cache().lock() {
+                                c.windows = ws;
+                                c.last_ok = Some(std::time::Instant::now());
+                            }
+                        }
+                        Err(e) => {
+                            let now = std::time::Instant::now();
+                            let due = last_warn
+                                .map(|t| {
+                                    now.duration_since(t) > std::time::Duration::from_secs(10)
+                                })
+                                .unwrap_or(true);
+                            if due {
+                                eprintln!("[menubar] daemon poll failed: {e}");
+                                last_warn = Some(now);
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
+        })
+        .expect("daemon poll thread");
+}
+
+/// Fresh daemon data (answered within the last 5s), or None.
+/// Main-thread safe: pure cache read, never blocks on IPC.
+fn cached_windows() -> Option<Vec<CoreWindows::WindowInfo>> {
+    let c = daemon_cache().lock().ok()?;
+    match c.last_ok {
+        Some(t) if t.elapsed() < std::time::Duration::from_secs(5) => Some(c.windows.clone()),
+        _ => None,
+    }
+}
+
+/// Daemon window list for the main thread (cached, never blocks).
 /// Returns `None` when unreachable so callers fall back to X11 fast.
 fn corewindows_windows() -> Option<Vec<CoreWindows::WindowInfo>> {
-    if !daemon_reachable() {
-        return None;
-    }
-    WindowsProvider::from_env().windows().ok()
+    cached_windows()
 }
 
 /// Shell windows (menubar/dock) are never shown as the app name:
@@ -1910,10 +1977,12 @@ fn spawn_bars(app: &Application) {
         let logical_h_c = logical_h;
         glib::idle_add_local_once(move || {
             if let Some(surface) = win_clone.surface() {
-                let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, logical_w_c, logical_h_c));
-                surface.set_input_region(&region);
                 if wayland_surface {
-                    eprintln!("[menubar] bar on wayland layer-shell, input region set");
+                    // Wayland layer-shell: never touch the input region.
+                    // The surface is exactly bar-sized, so full-surface
+                    // input is the default. A wrong/empty rect here would
+                    // silently eat all hover and click events.
+                    eprintln!("[menubar] bar on wayland layer-shell, input left at default");
                 } else if let Some(xid) = x11_place::xid_of(&surface) {
                     eprintln!("[menubar] bar on x11, xid={xid}");
                     x11_place::set_position_hints(xid, phys_x, phys_y);
@@ -1932,9 +2001,9 @@ fn spawn_bars(app: &Application) {
         let logical_h2 = logical_h;
         glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
             if let Some(surface) = win2.surface() {
-                let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, logical_w2, logical_h2));
-                surface.set_input_region(&region);
                 if !wayland_surface {
+                    let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(0, 0, logical_w2, logical_h2));
+                    surface.set_input_region(&region);
                     if let Some(xid) = x11_place::xid_of(&surface) {
                         x11_place::move_window(xid, phys_x, phys_y);
                         x11_place::disable_shadow(xid);
@@ -2034,6 +2103,7 @@ fn main() {
     }
 
     init_i18n();
+    start_daemon_poller();
 
     let app = Application::builder()
         .application_id("org.tontoo.menubar")
