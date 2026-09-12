@@ -533,7 +533,7 @@ fn menu_sf_icon(symbol: SFSymbol, color: IconColor) -> gtk::Widget {
 fn build_octopus_menu(parent: &impl IsA<gtk::Widget>) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
-    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_position(gtk::PositionType::Top);
     popover.set_autohide(true);
     popover.set_parent(parent);
     popover.set_offset(0, 6);
@@ -1080,7 +1080,7 @@ fn set_octopus_menu_content(popover: &gtk::Popover) {
 fn build_app_menu(parent: &impl IsA<gtk::Widget>, app_name: &str) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
-    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_position(gtk::PositionType::Top);
     popover.set_autohide(true);
     popover.set_parent(parent);
     popover.set_offset(0, 6);
@@ -1215,7 +1215,17 @@ fn register_top_menu(wrap: &gtk::Box, popover: &gtk::Popover, kind: TopMenuKind)
     click.set_button(1);
     let pop_c = popover.clone();
     let wrap_c = wrap.clone();
-    click.connect_pressed(move |_, _, _, _| {
+    click.connect_pressed(move |_, n_press, _, _| {
+        eprintln!("[menubar-debug] trigger clicked (press #{n_press})");
+        // DEBUG: trigger allocation at popup time (diagnose menu placement).
+        let alloc = wrap_c.allocation();
+        eprintln!(
+            "[menubar-debug] trigger alloc x={} y={} w={} h={}",
+            alloc.x(),
+            alloc.y(),
+            alloc.width(),
+            alloc.height()
+        );
         if pop_c.is_visible() {
             pop_c.popdown();
             wrap_c.remove_css_class("octopus-active");
@@ -1233,7 +1243,13 @@ fn register_top_menu(wrap: &gtk::Box, popover: &gtk::Popover, kind: TopMenuKind)
     let pop_h = popover.clone();
     let wrap_h = wrap.clone();
     let switcher = gtk::EventControllerMotion::new();
+    let switch_count = std::rc::Rc::new(std::cell::Cell::new(0u32));
     switcher.connect_enter(move |_, _, _| {
+        let n = switch_count.get();
+        if n < 10 {
+            eprintln!("[menubar-debug] hover-switch enter #{n}");
+            switch_count.set(n + 1);
+        }
         let other_open = TOP_MENUS.with(|m| {
             m.borrow()
                 .iter()
@@ -1255,7 +1271,7 @@ fn register_top_menu(wrap: &gtk::Box, popover: &gtk::Popover, kind: TopMenuKind)
 fn build_example_menu(parent: &impl IsA<gtk::Widget>, title: &'static str) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
-    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_position(gtk::PositionType::Top);
     popover.set_autohide(true);
     popover.set_parent(parent);
     popover.set_offset(0, 6);
@@ -1435,6 +1451,21 @@ fn build_bar_content(app_name: &str, scheme: ColorScheme, bar_height: i32) -> gt
     bar.set_halign(gtk::Align::Fill);
     bar.set_height_request(win_h_tmp);
     bar.set_overflow(gtk::Overflow::Visible);
+
+    // DEBUG (temporary): motion probe — proves pointer events reach the
+    // client at all. Logs the first 5 enters with coordinates.
+    {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let probe = gtk::EventControllerMotion::new();
+        probe.connect_enter(move |_, x, y| {
+            let n = count.get();
+            if n < 5 {
+                eprintln!("[menubar-debug] motion enter #{n} at ({x:.0},{y:.0})");
+                count.set(n + 1);
+            }
+        });
+        bar.add_controller(probe);
+    }
 
     let octopus = build_octopus_widget(bar_height);
     let octopus_wrap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1963,6 +1994,9 @@ fn spawn_bars(app: &Application) {
             win.set_anchor(gtk4_layer_shell::Edge::Bottom, false);
             win.set_exclusive_zone(win_h);
             win.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+            eprintln!("[menubar-debug] layer-shell pinned (top, exclusive={win_h})");
+        } else {
+            eprintln!("[menubar-debug] x11 backend path, layer-shell skipped");
         }
 
         // Present zuerst, dann X11-Move (Surface existiert erst nach Realize)
