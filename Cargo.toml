@@ -11,11 +11,9 @@ name = "menubar"
 path = "src/main.rs"
 
 [dependencies]
-sdk = { path = "/Library/System/sdk", features = ["UIKit", "CoreIcon", "CoreWindows", "Accessibility"] }
-gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
-gtk4-layer-shell = "0.5"
-glib = "0.20"
+# TontooOS SDK: TontooUI (layer-shell bar), CoreIcon (symbols/octopus),
+# CoreWindows (app classification, window actions), Accessibility (lang).
+sdk = { path = "/Library/System/sdk", features = ["TontooUI", "CoreIcon", "CoreWindows", "Accessibility"] }
+# X11 EWMH queries (active window, minimize/close) for app actions.
 x11rb = { version = "0.13", features = ["randr", "shape"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-image = "0.25"
+vello = "0.10"
